@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global styles for smooth scrolling and initial hidden state for animations */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Ensure elements start hidden before animation */
+.animate-on-scroll {
+  opacity: 0;
+  transform: translateY(20px); /* Default for fade-in-up */
+}
+
+.animate-on-scroll.fade-in-left {
+  transform: translateX(-50px);
+}
+
+.animate-on-scroll.fade-in-right {
+  transform: translateX(50px);
+}
