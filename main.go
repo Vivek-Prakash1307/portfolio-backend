@@ -34,11 +34,12 @@ type Project struct {
 }
 
 type ContactInfo struct {
-	Email    string `json:"email"`
-	Phone    string `json:"phone"`
-	Github   string `json:"github"`
-	Linkedin string `json:"linkedin"`
-	Leetcode string `json:"leetcode"`
+	Email         string `json:"email"`
+	Phone         string `json:"phone"`
+	Github        string `json:"github"`
+	Linkedin      string `json:"linkedin"`
+	Leetcode      string `json:"leetcode"`
+	Geeksforgeeks string `json:"geeksforgeeks"`
 }
 
 // ContactMessage struct for handling contact form submissions
@@ -133,11 +134,12 @@ func getResumeData(c *gin.Context) {
 			},
 		},
 		Contact: ContactInfo{
-			Email:    "alivevivek8@gmail.com",
-			Phone:    "+91 7309058513",
-			Github:   "github.com/Vivek-Prakash1307",
-			Linkedin: "linkedin.com/in/vivek-prakash-00230a300",
-			Leetcode: "leetcode.com/u/alivevivek8",
+			Email:         "alivevivek8@gmail.com",
+			Phone:         "+91 7309058513",
+			Github:        "github.com/Vivek-Prakash1307",
+			Linkedin:      "linkedin.com/in/vivek-prakash-00230a300",
+			Leetcode:      "leetcode.com/u/alivevivek8",
+			Geeksforgeeks: "geeksforgeeks.org/user/alivevng22/",
 		},
 	}
 
