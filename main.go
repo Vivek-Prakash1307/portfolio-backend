@@ -122,7 +122,13 @@ func getResumeData(c *gin.Context) {
 			{
 				Title:        "Load Balancer (Go)",
 				Description:  "Built a lightweight HTTP load balancer using round-robin algorithm with custom server health checks. Improved request distribution and fault tolerance for backend microservices.",
-				Github:       "https://github.com/Vivek-Prakash1307/load-balancer",
+				Github:       "https://github.com/Vivek-Prakash1307/Load_Balancer",
+				Technologies: []string{"Go"},
+			},
+			{
+				Title:        "URL_SHORTENER (Go)",
+				Description:  "Built a lightweight HTTP load balancer using round-robin algorithm with custom server health checks. Improved request distribution and fault tolerance for backend microservices.",
+				Github:       "https://github.com/Vivek-Prakash1307/URL_SHORTENER",
 				Technologies: []string{"Go"},
 			},
 		},
