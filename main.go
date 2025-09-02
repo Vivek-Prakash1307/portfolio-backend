@@ -102,9 +102,9 @@ func getResumeData(c *gin.Context) {
 				Technologies: []string{"Go"},
 			},
 			{
-				Title:        "Amazon Clone UI (HTML, CSS, JS)",
-				Description:  "Created a fully responsive e-commerce interface mimicking Amazon's layout and product cards. Focused on responsive design principles to ensure cross-device compatibility.",
-				Github:       "https://github.com/Vivek-Prakash1307/amazon-clone",
+				Title:        "Go-Stock-scrapper",
+				Description:  "A web scraping tool built with Go (Golang) and Colly to fetch live stock market data from Yahoo Finance. The program collects information such as company name, current stock price, and percentage change, then stores the results in a CSV file for further analysis or record-keeping.",
+				Github:       "https://github.com/Vivek-Prakash1307/Stock-Scrapper",
 				Technologies: []string{"HTML", "CSS", "JavaScript"},
 			},
 			{
@@ -116,7 +116,7 @@ func getResumeData(c *gin.Context) {
 			{
 				Title:        "Weather Tracker",
 				Description:  "Combined two microservices: a weather dashboard using OpenWeatherMap API and a secure URL shortener with JWT authentication. Implemented MongoDB integration for persistent shortlink storage.",
-				Github:       "https://github.com/Vivek-Prakash1307/weather-url-shortener",
+				Github:       "https://github.com/Vivek-Prakash1307/Weather-app",
 				Technologies: []string{"Go", "MongoDB"},
 			},
 			{
