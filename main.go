@@ -111,7 +111,7 @@ func getResumeData(c *gin.Context) {
 			{
 				Title:        "Web Server API (Go, MySQL)",
 				Description:  "Developed RESTful API endpoints using Gin and GORM for user authentication and product management. Integrated MySQL database with complete CRUD operations.",
-				Github:       "https://github.com/Vivek-Prakash1307/web-server-api",
+				Github:       "https://github.com/Vivek-Prakash1307/Web-Server-API",
 				Technologies: []string{"Go", "MySQL", "Gin", "GORM"},
 			},
 			{
