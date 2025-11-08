@@ -62,13 +62,17 @@ func main() {
 	router := gin.Default()
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:3000", "https://portfolio-frontend-one-ruddy.vercel.app"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
-		MaxAge:           86400,
-	}))
+    AllowOrigins: []string{
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://portfolio-frontend-one-ruddy.vercel.app",
+    },
+    AllowMethods:     []string{"GET", "POST", "OPTIONS","PUT","DELETE"},
+    AllowHeaders:     []string{"Origin", "Content-Type", "Accept","Authorization"},
+    ExposeHeaders:    []string{"Content-Length"},
+    AllowCredentials: true,
+    MaxAge:           12 * time.Hour,
+}))
 
 	router.GET("/api/resume", getResumeData)
 	router.POST("/api/contact", handleContactForm)
@@ -163,7 +167,7 @@ func handleContactForm(c *gin.Context) {
 	// ✅ Use environment variables (better security)
 	emailConfig := EmailConfig{
 		SMTPHost:     getEnv("SMTP_HOST", "smtp.gmail.com"),
-		SMTPPort:     getEnv("SMTP_PORT", "587"),
+		SMTPPort:     getEnv("SMTP_PORT", "587"), // it request made by the client to server with TLS encryption
 		SMTPUsername: getEnv("SMTP_USERNAME", "alivevivek8@gmail.com"),
 		SMTPPassword: getEnv("SMTP_PASSWORD", "uvlbngsiqdboumkg"), // fallback app password
 		ToEmail:      getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
@@ -192,21 +196,21 @@ func sendEmail(config EmailConfig, contactMsg ContactMessage) error {
 	subject := fmt.Sprintf("Portfolio Contact: Message from %s", contactMsg.Name)
 
 	body := fmt.Sprintf(`
-New contact form submission from your portfolio website:
+	New contact form submission from your portfolio website:
 
-📋 Contact Details:
-------------------
-Name: %s
-Email: %s
-Submitted: %s
+	📋 Contact Details:
+	------------------
+	Name: %s
+	Email: %s
+	Submitted: %s
 
-💬 Message:
------------
-%s
+	💬 Message:
+	-----------
+	%s
 
----
-This message was sent from your portfolio contact form.
-`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
+	---
+	This message was sent from your portfolio contact form.
+	`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
 
 	message := fmt.Sprintf("From: %s\r\n", config.SMTPUsername) +
 		fmt.Sprintf("To: %s\r\n", config.ToEmail) +
