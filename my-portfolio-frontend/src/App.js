@@ -172,6 +172,7 @@ const handleSubmit = async (e) => {
   setSubmitStatus({ type: '', message: '' });
 
   const API_URL = process.env.REACT_APP_API_URL || "http://localhost:8080";
+  console.log("🌍 API_URL in build:", API_URL);
 
   try {
     const response = await fetch(`${API_URL}/api/contact`, {
