@@ -62,13 +62,17 @@ func main() {
 	router := gin.Default()
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:3000", "https://portfolio-frontend-one-ruddy.vercel.app", "https://portfolio-frontend.vercel.app"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
-		MaxAge:           86400,
-	}))
+    AllowOrigins: []string{
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://portfolio-frontend-one-ruddy.vercel.app",
+    },
+    AllowMethods:     []string{"GET", "POST", "OPTIONS","PUT","DELETE"},
+    AllowHeaders:     []string{"Origin", "Content-Type", "Accept","Authorization"},
+    ExposeHeaders:    []string{"Content-Length"},
+    AllowCredentials: true,
+    MaxAge:           12 * time.Hour,
+}))
 
 	router.GET("/api/resume", getResumeData)
 	router.POST("/api/contact", handleContactForm)
