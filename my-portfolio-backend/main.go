@@ -34,11 +34,12 @@ type Project struct {
 }
 
 type ContactInfo struct {
-	Email    string `json:"email"`
-	Phone    string `json:"phone"`
-	Github   string `json:"github"`
-	Linkedin string `json:"linkedin"`
-	Leetcode string `json:"leetcode"`
+	Email         string `json:"email"`
+	Phone         string `json:"phone"`
+	Github        string `json:"github"`
+	Linkedin      string `json:"linkedin"`
+	Leetcode      string `json:"leetcode"`
+	Geeksforgeeks string `json:"geeksforgeeks"`
 }
 
 // ContactMessage struct for handling contact form submissions
@@ -61,7 +62,7 @@ func main() {
 	router := gin.Default()
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:3000"},
+		AllowOrigins:     []string{"http://localhost:3000", "http://127.0.0.1:3000", "https://portfolio-frontend-one-ruddy.vercel.app"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -91,47 +92,54 @@ func getResumeData(c *gin.Context) {
 			{Category: "Languages", Items: []string{"Go", "C++", "HTML", "CSS", "JavaScript"}},
 			{Category: "Frameworks/Tools", Items: []string{"Gin", "GORM", "Git", "Docker", "Bash", "Linux", "React", "Tailwind CSS"}},
 			{Category: "Databases", Items: []string{"MySQL", "PostgreSQL", "MongoDB"}},
-			{Category: "Core CS", Items: []string{"Data Structures", "Algorithms", "OOP", "OS", "Computer Networks"}},
+			{Category: "Core CS", Items: []string{"Data Structures", "Algorithms", "Object Oriented Programming", "Operating System", "Computer Networks"}},
 			{Category: "Soft Skills", Items: []string{"Team Collaboration", "Debugging", "Code Optimization", "Communication"}},
 		},
 		Projects: []Project{
 			{
-				Title:        "Email Checker Tool (Go)",
+				Title:        "Email-Intelligence-Platform",
 				Description:  "Built a Go-based utility that validates email syntax and domain existence using modular design and efficient error handling. Improved input reliability by integrating domain lookup APIs.",
-				Github:       "https://github.com/Vivek-Prakash1307/email-checker",
+				Github:       "https://github.com/Vivek-Prakash1307/email-intelligence-platform",
 				Technologies: []string{"Go"},
 			},
 			{
-				Title:        "Amazon Clone UI (HTML, CSS, JS)",
-				Description:  "Created a fully responsive e-commerce interface mimicking Amazon's layout and product cards. Focused on responsive design principles to ensure cross-device compatibility.",
-				Github:       "https://github.com/Vivek-Prakash1307/amazon-clone",
+				Title:        "Go-Stock-scrapper",
+				Description:  "A web scraping tool built with Go (Golang) and Colly to fetch live stock market data from Yahoo Finance. The program collects information such as company name, current stock price, and percentage change, then stores the results in a CSV file for further analysis or record-keeping.",
+				Github:       "https://github.com/Vivek-Prakash1307/Stock-Scrapper",
 				Technologies: []string{"HTML", "CSS", "JavaScript"},
 			},
 			{
-				Title:        "Web Server API (Go, MySQL)",
+				Title:        "Web Server API",
 				Description:  "Developed RESTful API endpoints using Gin and GORM for user authentication and product management. Integrated MySQL database with complete CRUD operations.",
-				Github:       "https://github.com/Vivek-Prakash1307/web-server-api",
+				Github:       "https://github.com/Vivek-Prakash1307/Web-Server-API",
 				Technologies: []string{"Go", "MySQL", "Gin", "GORM"},
 			},
 			{
-				Title:        "Weather Tracker",
+				Title:        "Weather-app",
 				Description:  "Combined two microservices: a weather dashboard using OpenWeatherMap API and a secure URL shortener with JWT authentication. Implemented MongoDB integration for persistent shortlink storage.",
-				Github:       "https://github.com/Vivek-Prakash1307/weather-url-shortener",
+				Github:       "https://github.com/Vivek-Prakash1307/Weather-app",
 				Technologies: []string{"Go", "MongoDB"},
 			},
 			{
-				Title:        "Load Balancer (Go)",
+				Title:        "HTTP Load Balancer",
 				Description:  "Built a lightweight HTTP load balancer using round-robin algorithm with custom server health checks. Improved request distribution and fault tolerance for backend microservices.",
-				Github:       "https://github.com/Vivek-Prakash1307/load-balancer",
+				Github:       "https://github.com/Vivek-Prakash1307/Load_Balancer",
+				Technologies: []string{"Go"},
+			},
+			{
+				Title:        "URL_SHORTENER",
+				Description:  "Built a lightweight HTTP load balancer using round-robin algorithm with custom server health checks. Improved request distribution and fault tolerance for backend microservices.",
+				Github:       "https://github.com/Vivek-Prakash1307/URL_SHORTENER",
 				Technologies: []string{"Go"},
 			},
 		},
 		Contact: ContactInfo{
-			Email:    "alivevivek8@gmail.com",
-			Phone:    "+91 7309058513",
-			Github:   "github.com/Vivek-Prakash1307",
-			Linkedin: "linkedin.com/in/vivek-prakash-00230a300",
-			Leetcode: "leetcode.com/u/alivevivek8",
+			Email:         "alivevivek8@gmail.com",
+			Phone:         "+91 7309058513",
+			Github:        "github.com/Vivek-Prakash1307",
+			Linkedin:      "linkedin.com/in/vivek-prakash-00230a300",
+			Leetcode:      "leetcode.com/u/alivevivek8",
+			Geeksforgeeks: "geeksforgeeks.org/user/alivevng22/",
 		},
 	}
 
@@ -155,7 +163,7 @@ func handleContactForm(c *gin.Context) {
 	// ✅ Use environment variables (better security)
 	emailConfig := EmailConfig{
 		SMTPHost:     getEnv("SMTP_HOST", "smtp.gmail.com"),
-		SMTPPort:     getEnv("SMTP_PORT", "587"),
+		SMTPPort:     getEnv("SMTP_PORT", "587"), // it request made by the client to server with TLS encryption
 		SMTPUsername: getEnv("SMTP_USERNAME", "alivevivek8@gmail.com"),
 		SMTPPassword: getEnv("SMTP_PASSWORD", "uvlbngsiqdboumkg"), // fallback app password
 		ToEmail:      getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
@@ -184,21 +192,21 @@ func sendEmail(config EmailConfig, contactMsg ContactMessage) error {
 	subject := fmt.Sprintf("Portfolio Contact: Message from %s", contactMsg.Name)
 
 	body := fmt.Sprintf(`
-New contact form submission from your portfolio website:
+	New contact form submission from your portfolio website:
 
-📋 Contact Details:
-------------------
-Name: %s
-Email: %s
-Submitted: %s
+	📋 Contact Details:
+	------------------
+	Name: %s
+	Email: %s
+	Submitted: %s
 
-💬 Message:
------------
-%s
+	💬 Message:
+	-----------
+	%s
 
----
-This message was sent from your portfolio contact form.
-`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
+	---
+	This message was sent from your portfolio contact form.
+	`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
 
 	message := fmt.Sprintf("From: %s\r\n", config.SMTPUsername) +
 		fmt.Sprintf("To: %s\r\n", config.ToEmail) +
