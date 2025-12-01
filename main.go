@@ -7,7 +7,7 @@ import (
 	"net/smtp"
 	"os"
 	"time"
-
+	"strings"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
@@ -61,12 +61,20 @@ type EmailConfig struct {
 func main() {
 	router := gin.Default()
 
+	originsEnv := getEnv("ALLOWED_ORIGINS", "http://localhost:3000")
+	// allow comma-separated list if you ever add more
+	var allowedOrigins []string
+	for _, o := range strings.Split(originsEnv, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			allowedOrigins = append(allowedOrigins, o)
+		}
+	}
+
+	log.Printf("✅ CORS AllowOrigins: %+v\n", allowedOrigins)
+
 	router.Use(cors.New(cors.Config{
-    AllowOrigins: []string{
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://portfolio-frontend-one-ruddy.vercel.app",
-    },
+    AllowOrigins: allowedOrigins,
     AllowMethods:     []string{"GET", "POST", "OPTIONS","PUT","DELETE"},
     AllowHeaders:     []string{"Origin", "Content-Type", "Accept","Authorization"},
     ExposeHeaders:    []string{"Content-Length"},
@@ -171,6 +179,15 @@ func handleContactForm(c *gin.Context) {
 		SMTPUsername: getEnv("SMTP_USERNAME", "alivevivek8@gmail.com"),
 		SMTPPassword: getEnv("SMTP_PASSWORD", "uvlbngsiqdboumkg"), // fallback app password
 		ToEmail:      getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
+	}
+
+	
+	if emailConfig.SMTPPassword == "" {
+		log.Println("❌ SMTP password empty – check SMTP_PASSWORD in Render env")
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Email is not configured correctly on server.",
+		})
+		return
 	}
 
 	// Send email
