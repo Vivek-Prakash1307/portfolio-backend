@@ -1,15 +1,16 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"net/http"
-	"net/smtp"
-	"os"
-	"time"
+	"bytes"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "time"
 	"strings"
-	"github.com/gin-contrib/cors"
-	"github.com/gin-gonic/gin"
+    "github.com/gin-contrib/cors"
+    "github.com/gin-gonic/gin"
 )
 
 type ResumeData struct {
@@ -51,12 +52,11 @@ type ContactMessage struct {
 
 // EmailConfig holds email configuration
 type EmailConfig struct {
-	SMTPHost     string
-	SMTPPort     string
-	SMTPUsername string
-	SMTPPassword string
-	ToEmail      string
+    APIKey    string
+    FromEmail string
+    ToEmail   string
 }
+
 
 func main() {
 	router := gin.Default()
@@ -161,93 +161,113 @@ func getResumeData(c *gin.Context) {
 
 // handleContactForm processes contact form submissions and sends email
 func handleContactForm(c *gin.Context) {
-	var contactMsg ContactMessage
+    var contactMsg ContactMessage
 
-	// Bind and validate JSON input
-	if err := c.ShouldBindJSON(&contactMsg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":   "Invalid input data",
-			"details": err.Error(),
-		})
-		return
-	}
+    // Bind and validate JSON input
+    if err := c.ShouldBindJSON(&contactMsg); err != nil {
+        log.Printf("❌ Bind error in /api/contact: %v", err)
+        c.JSON(http.StatusBadRequest, gin.H{
+            "error":   "Invalid input data",
+            "details": err.Error(),
+        })
+        return
+    }
 
-	// ✅ Use environment variables (better security)
-	emailConfig := EmailConfig{
-		SMTPHost:     getEnv("SMTP_HOST", "smtp.gmail.com"),
-		SMTPPort:     getEnv("SMTP_PORT", "587"), // it request made by the client to server with TLS encryption
-		SMTPUsername: getEnv("SMTP_USERNAME", "alivevivek8@gmail.com"),
-		SMTPPassword: getEnv("SMTP_PASSWORD", "uvlbngsiqdboumkg"), // fallback app password
-		ToEmail:      getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
-	}
+    log.Printf("📩 Contact request: %+v", contactMsg)
 
-	
-	if emailConfig.SMTPPassword == "" {
-		log.Println("❌ SMTP password empty – check SMTP_PASSWORD in Render env")
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Email is not configured correctly on server.",
-		})
-		return
-	}
+    // ✅ Resend email config (HTTP API, no SMTP)
+    emailConfig := EmailConfig{
+        APIKey:    getEnv("RESEND_API_KEY", ""),
+        FromEmail: getEnv("FROM_EMAIL", ""),
+        ToEmail:   getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
+    }
 
-	// Send email
-	if err := sendEmail(emailConfig, contactMsg); err != nil {
-		log.Printf("❌ Failed to send email: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to send message. Please try again later.",
-		})
-		return
-	}
+    if emailConfig.APIKey == "" || emailConfig.FromEmail == "" {
+        log.Println("❌ Email not configured correctly – RESEND_API_KEY or FROM_EMAIL missing")
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Email service is not configured correctly on server.",
+        })
+        return
+    }
 
-	// Log the contact attempt
-	log.Printf("📧 New contact message from %s (%s)", contactMsg.Name, contactMsg.Email)
+    // Send email via Resend HTTP API
+    if err := sendEmail(emailConfig, contactMsg); err != nil {
+        log.Printf("❌ Failed to send email via Resend: %v", err)
+        c.JSON(http.StatusInternalServerError, gin.H{
+            "error": "Failed to send message. Please try again later.",
+        })
+        return
+    }
 
-	c.JSON(http.StatusOK, gin.H{
-		"message": "Message sent successfully! I'll get back to you soon.",
-		"status":  "success",
-	})
+    // Log the contact attempt
+    log.Printf("✅ Email sent successfully from %s (%s)", contactMsg.Name, contactMsg.Email)
+
+    c.JSON(http.StatusOK, gin.H{
+        "message": "Message sent successfully! I'll get back to you soon.",
+        "status":  "success",
+    })
 }
+
 
 // sendEmail sends the contact form email using SMTP
+// sendEmail uses Resend HTTP API to send the contact form email
 func sendEmail(config EmailConfig, contactMsg ContactMessage) error {
-	subject := fmt.Sprintf("Portfolio Contact: Message from %s", contactMsg.Name)
+    subject := fmt.Sprintf("Portfolio Contact: Message from %s", contactMsg.Name)
 
-	body := fmt.Sprintf(`
-	New contact form submission from your portfolio website:
+    body := fmt.Sprintf(`
+New contact form submission from your portfolio website:
 
-	📋 Contact Details:
-	------------------
-	Name: %s
-	Email: %s
-	Submitted: %s
+Name: %s
+Email: %s
+Time: %s
 
-	💬 Message:
-	-----------
-	%s
+Message:
+%s
 
-	---
-	This message was sent from your portfolio contact form.
-	`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
+--
+This message was sent from your portfolio contact form.
+`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
 
-	message := fmt.Sprintf("From: %s\r\n", config.SMTPUsername) +
-		fmt.Sprintf("To: %s\r\n", config.ToEmail) +
-		fmt.Sprintf("Subject: %s\r\n", subject) +
-		fmt.Sprintf("Reply-To: %s\r\n", contactMsg.Email) +
-		"\r\n" +
-		body
+    // Resend API payload
+    payload := map[string]interface{}{
+        "from":    fmt.Sprintf("Portfolio Contact <%s>", config.FromEmail),
+        "to":      []string{config.ToEmail},
+        "subject": subject,
+        "text":    body,
+    }
 
-	auth := smtp.PlainAuth("", config.SMTPUsername, config.SMTPPassword, config.SMTPHost)
+    buf := new(bytes.Buffer)
+    if err := json.NewEncoder(buf).Encode(payload); err != nil {
+        return fmt.Errorf("failed to encode email payload: %w", err)
+    }
 
-	err := smtp.SendMail(
-		config.SMTPHost+":"+config.SMTPPort,
-		auth,
-		config.SMTPUsername,
-		[]string{config.ToEmail},
-		[]byte(message),
-	)
+    req, err := http.NewRequest("POST", "https://api.resend.com/emails", buf)
+    if err != nil {
+        return fmt.Errorf("failed to create HTTP request: %w", err)
+    }
 
-	return err
+    req.Header.Set("Authorization", "Bearer "+config.APIKey)
+    req.Header.Set("Content-Type", "application/json")
+
+    client := &http.Client{
+        Timeout: 10 * time.Second,
+    }
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return fmt.Errorf("failed to send HTTP request to Resend: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode >= 300 {
+        var respBody bytes.Buffer
+        _, _ = respBody.ReadFrom(resp.Body)
+        return fmt.Errorf("Resend returned status %d: %s", resp.StatusCode, respBody.String())
+    }
+
+    return nil
 }
+
 
 // ✅ helper function to safely load env vars
 func getEnv(key, fallback string) string {
