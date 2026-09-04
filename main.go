@@ -2,15 +2,36 @@ package main
 
 import (
 	"bytes"
-    "encoding/json"
-    "fmt"
-    "log"
-    "net/http"
-    "os"
-    "time"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
 	"strings"
-    "github.com/gin-contrib/cors"
-    "github.com/gin-gonic/gin"
+	"sync"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+)
+
+const (
+	defaultPort        = "8080"
+	maxContactBodySize = 16 << 10
+	resendEndpoint     = "https://api.resend.com/emails"
+)
+
+var (
+	resumeData       = buildResumeData()
+	resumeJSON       = mustJSON(resumeData)
+	resumeETag       = weakETag(resumeJSON)
+	resendHTTPClient = &http.Client{Timeout: 8 * time.Second}
 )
 
 type ResumeData struct {
@@ -43,273 +64,212 @@ type ContactInfo struct {
 	Geeksforgeeks string `json:"geeksforgeeks"`
 }
 
-// ContactMessage struct for handling contact form submissions
 type ContactMessage struct {
-	Name    string `json:"name" binding:"required"`
-	Email   string `json:"email" binding:"required,email"`
-	Message string `json:"message" binding:"required"`
+	Name    string `json:"name" binding:"required,min=2,max=80"`
+	Email   string `json:"email" binding:"required,email,max=160"`
+	Message string `json:"message" binding:"required,min=10,max=3000"`
 }
 
-// EmailConfig holds email configuration
 type EmailConfig struct {
-    APIKey    string
-    FromEmail string
-    ToEmail   string
+	APIKey    string
+	FromEmail string
+	ToEmail   string
 }
 
+type queuedEmail struct {
+	config  EmailConfig
+	message ContactMessage
+}
+
+type emailDispatcher struct {
+	queue chan queuedEmail
+	send  func(context.Context, EmailConfig, ContactMessage) error
+}
+
+type rateLimiter struct {
+	mu       sync.Mutex
+	visitors map[string]*visitor
+	limit    int
+	window   time.Duration
+}
+
+type visitor struct {
+	count     int
+	expiresAt time.Time
+}
 
 func main() {
-	router := gin.Default()
+	router := setupRouter()
+	port := getEnv("PORT", defaultPort)
 
-	originsEnv := getEnv("ALLOWED_ORIGINS", "http://localhost:3000")
-	// allow comma-separated list if you ever add more
-	var allowedOrigins []string
-	for _, o := range strings.Split(originsEnv, ",") {
-		o = strings.TrimSpace(o)
-		if o != "" {
-			allowedOrigins = append(allowedOrigins, o)
-		}
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       8 * time.Second,
+		WriteTimeout:      12 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
-	log.Printf("✅ CORS AllowOrigins: %+v\n", allowedOrigins)
+	log.Printf("Portfolio API server listening on :%s", port)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("failed to run server: %v", err)
+	}
+}
 
+func setupRouter() *gin.Engine {
+	if getEnv("GIN_MODE", "") == "" && getEnv("APP_ENV", "") == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("%s %s %d %s %s\n",
+			param.Method,
+			param.Path,
+			param.StatusCode,
+			param.Latency,
+			param.ClientIP,
+		)
+	}))
+	router.Use(securityHeaders())
 	router.Use(cors.New(cors.Config{
-    AllowOrigins: allowedOrigins,
-    AllowMethods:     []string{"GET", "POST", "OPTIONS","PUT","DELETE"},
-    AllowHeaders:     []string{"Origin", "Content-Type", "Accept","Authorization"},
-    ExposeHeaders:    []string{"Content-Length"},
-    AllowCredentials: true,
-    MaxAge:           12 * time.Hour,
-}))
+		AllowOrigins:     parseCSVEnv("ALLOWED_ORIGINS", "http://localhost:3000"),
+		AllowMethods:     []string{http.MethodGet, http.MethodPost, http.MethodOptions},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length", "ETag"},
+		AllowCredentials: false,
+		MaxAge:           12 * time.Hour,
+	}))
 
+	contactLimiter := newRateLimiter(5, 10*time.Minute)
+	dispatcher := newEmailDispatcher(100, sendEmail)
+	dispatcher.start(2)
+
+	router.GET("/api/health", healthHandler)
 	router.GET("/api/resume", getResumeData)
-	router.POST("/api/contact", handleContactForm)
-	router.GET("/api/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "healthy", "service": "portfolio-api"})
-	})
+	router.POST("/api/contact", limitBody(maxContactBodySize), contactLimiter.middleware(), handleContactForm(dispatcher))
 
-	port := ":8080"
-	log.Printf("🚀 Portfolio API server starting on port %s", port)
-	if err := router.Run(port); err != nil {
-		log.Fatalf("❌ Failed to run server: %v", err)
+	return router
+}
+
+func securityHeaders() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Next()
 	}
+}
+
+func limitBody(limit int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		c.Next()
+	}
+}
+
+func healthHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "healthy",
+		"service": "portfolio-api",
+		"time":    time.Now().UTC().Format(time.RFC3339),
+	})
 }
 
 func getResumeData(c *gin.Context) {
-	data := ResumeData{
-		Name:    "Vivek Prakash",
-		Tagline: "Full Stack Developer | Go, React, JavaScript Enthusiast",
-		About:   "A passionate and results-driven Full Stack Developer with a strong foundation in Go, React, JavaScript, and various database technologies. I thrive on building robust, scalable, and user-friendly applications. With experience in developing RESTful APIs, responsive UIs, and microservices, I am always eager to learn new technologies and solve complex problems.",
-		Skills: []SkillCategory{
-			{Category: "Languages", Items: []string{"Go", "C++", "HTML", "CSS", "JavaScript","Java","Python"}},
-			{Category: "Frameworks/Tools", Items: []string{"Gin", "GORM", "Git", "Docker", "Bash", "Linux", "React", "Tailwind CSS","Fiber"}},
-			{Category: "Databases", Items: []string{"MySQL", "PostgreSQL", "MongoDB"}},
-			{Category: "Core CS", Items: []string{"Data Structures", "Algorithms", "Object Oriented Programming", "Operating System", "Computer Networks"}},
-			{Category: "Soft Skills", Items: []string{"Team Collaboration", "Debugging", "Code Optimization", "Communication"}},
-		},
-		Projects: []Project{
-			{
-				Title:        "Email-Intelligence-Platform",
-				Description:  "Built a Go-based utility that validates email syntax and domain existence using modular design and efficient error handling. Improved input reliability by integrating domain lookup APIs.",
-				Github:       "https://email-intelligence-platform-eora.vercel.app/",
-				Technologies: []string{  "Go (Golang)",
-					"Gin (HTTP Framework)",
-					"Goroutines (Concurrency)",
-					"REST APIs",
-					"DNS MX Record Lookup",
-					"SMTP Validation (Basic)",
-					"CORS Handling",
-					"React",
-					"HTML",
-					"CSS",
-					"Tailwind CSS",
-					"PostgreSQL / MySQL",
-					"Docker",
-					"Linux",
-					"Git",
-					"GitHub",
-					"Postman",
-					"Render (Backend Deployment)",
-					"Vercel (Frontend Deployment)",
-				},
-			},
-			{
-				Title:        "Go-Stock-scrapper",
-				Description:  "A web scraping tool built with Go (Golang) and Colly to fetch live stock market data from Yahoo Finance. The program collects information such as company name, current stock price, and percentage change, then stores the results in a CSV file for further analysis or record-keeping.",
-				Github:       "https://github.com/Vivek-Prakash1307/Stock-Scrapper",
-				Technologies: []string{"HTML", "CSS", "JavaScript"},
-			},
-			{
-				Title:        "Web Server API",
-				Description:  "Developed RESTful API endpoints using Gin and GORM for user authentication and product management. Integrated MySQL database with complete CRUD operations.",
-				Github:       "https://github.com/Vivek-Prakash1307/Web-Server-API",
-				Technologies: []string{"Go", "MySQL", "Gin", "GORM"},
-			},
-			{
-				Title:        "Weather-app",
-				Description:  "Combined two microservices: a weather dashboard using OpenWeatherMap API and a secure URL shortener with JWT authentication. Implemented MongoDB integration for persistent shortlink storage.",
-				Github:       "https://github.com/Vivek-Prakash1307/Weather-app",
-				Technologies: []string{  "Go (Golang)",
-								"Gin (HTTP Framework)",
-								"REST APIs",
-								"External Weather API Integration",
-								"In-Memory Caching",
-								"JSON Data Handling",
-								"HTTP Client",
-								"Error Handling & Logging",
-								"Docker",
-								"Linux",
-								"Git",
-								"GitHub",
-								"Postman",
-								"Health Checks",
-								"Microservice Architecture"},
-			},
-			{
-				Title:        "HTTP Load Balancer",
-				Description:  "Built a lightweight HTTP load balancer using round-robin algorithm with custom server health checks. Improved request distribution and fault tolerance for backend microservices.",
-				Github:       "https://github.com/Vivek-Prakash1307/Load_Balancer",
-				Technologies: []string{"Go","net/http","Reverse Proxy",
-   					 "Round-Robin Load Balancing", "Goroutines (Concurrency)"},
-			},
-			{
-				Title:        "URL_SHORTENER",
-				Description:  "Built a lightweight HTTP load balancer using round-robin algorithm with custom server health checks. Improved request distribution and fault tolerance for backend microservices.",
-				Github:       "https://github.com/Vivek-Prakash1307/URL_SHORTENER",
-				Technologies: []string{"Go"},
-			},
-			{
-				Title:        "Slack-bot",
-				Description:  "Built a Go-based Slack bot that listens to user commands, parses input parameters, and calculates age from the provided year of birth. The bot securely loads environment variables, handles invalid input gracefully, and processes Slack command events concurrently using Go routines.",
-				Github:       "https://github.com/Vivek-Prakash1307/Slack-bot",
-				Technologies: []string{"Go (Golang)", "Slack API", "Slacker Framework", "dotenv"," Goroutines", "Context API", "Environment Variables", "Input Validation"},
-			},
-			{
-				Title:        "PPT-to-PDF-Converter",
-				Description:  "Built a production-ready Go web application that converts multiple document formats (PPT, PPTX, ODP, DOC, DOCX, ODT) to PDF with enterprise-grade performance. Features concurrent job processing, real-time progress tracking, 100MB file support, and optimized LibreOffice integration. Deployed with Docker containerization on Railway with automated health checks, file cleanup routines, and comprehensive error handling.",
-				Github:       "https://github.com/Vivek-Prakash1307/PPT-TO-PDF-CONVERTER",
-				Technologies: []string{"Go (Golang)", "Gin Framework", "LibreOffice", "Docker", "Railway", "Ubuntu", "JavaScript ES6+", "HTML5", "CSS3", "RESTful APIs", "Concurrent Processing", "File Storage Systems", "YAML Configuration", "Logrus", "UUID", "CORS Middleware", "Health Monitoring", "CI/CD Pipeline", "Container Orchestration", "Process Management"},
-			},
-			{
-				Title:        "Chunked-File-Uploader",
-				Description:  "Built a production-ready React TypeScript web application featuring robust chunked file uploads with enterprise-grade reliability. Implements deterministic state machine architecture, automatic retry mechanisms with exponential backoff, IndexedDB persistence for upload resumption, real-time progress tracking, and comprehensive accessibility support. Features pause/resume functionality, checksum verification, concurrent chunk processing, and extensive test coverage with Vitest, React Testing Library, and Storybook integration.",
-				Github:       "https://github.com/Vivek-Prakash1307/chunked-file-uploader", // Add your GitHub URL here
-				Technologies: []string{
-					"React 19", 
-					"TypeScript", 
-					"Vite", 
-					"IndexedDB", 
-					"Web Crypto API", 
-					"State Machine Architecture", 
-					"Chunked Upload Protocol", 
-					"Checksum Verification", 
-					"Vitest", 
-					"React Testing Library", 
-					"Storybook", 
-					"Playwright", 
-					"ESLint", 
-					"Accessibility (WCAG)", 
-					"Drag & Drop API", 
-					"File API", 
-					"Concurrent Processing", 
-					"Error Recovery", 
-					"Progress Tracking", 
-					"Persistence Layer", 
-					"Component Testing", 
-					"Visual Testing", 
-					"CI/CD Pipeline",
-				},
-			},
+	c.Header("Cache-Control", "public, max-age=300, stale-while-revalidate=60")
+	c.Header("ETag", resumeETag)
+	c.Header("Content-Type", "application/json; charset=utf-8")
 
-			{
-				Title:        "TaskFlow-Task-Management-App",
-				Description:  "Built a full-stack task management application with modern SaaS-style authentication and kanban board functionality. Features secure JWT-based user authentication, responsive mobile-first UI design, real-time task operations (CRUD), and organized task categorization with color-coded status indicators (Todo-Red, In Progress-Yellow, Completed-Green). Implemented with React frontend using Tailwind CSS for modern UI components, Node.js/Express backend with MongoDB database, and comprehensive error handling with loading states.",
-				Github:       "https://github.com/Vivek-Prakash1307/PrimeTrade",
-				Technologies: []string{"React.js", "Node.js", "Express.js", "MongoDB", "Mongoose ODM", "JWT Authentication", "bcryptjs", "Tailwind CSS", "Vite", "Axios", "React Router DOM", "Context API", "JavaScript ES6+", "HTML5", "CSS3", "RESTful APIs", "CORS Middleware", "dotenv", "Responsive Design", "Mobile-First Design", "SaaS UI/UX", "Kanban Board", "Real-time Updates", "Form Validation", "Error Handling", "Loading States", "Local Storage", "Modern Authentication Flow"},
-			},
-
-			{
-				Title:        "CLI-Task-Manager",
-				Description:  "Built a command-line task management application in Go with interactive terminal interface. Features include adding new tasks with unique IDs, listing all tasks with completion status, marking tasks as done, and persistent session management. Implements clean CLI commands (add, list, done, exit) with real-time feedback and error handling for invalid operations. The application uses Go's built-in packages for efficient I/O operations and string manipulation, providing a lightweight and fast task management solution for developers who prefer terminal-based workflows.",
-				Github:       "https://github.com/Vivek-Prakash1307/ToDo-List",
-				Technologies: []string{"Go", "Go Modules", "bufio Package", "Command Line Interface", "Terminal I/O", "Interactive Shell"},
-			},
-
-
-
-
-		},
-		Contact: ContactInfo{
-			Email:         "alivevivek8@gmail.com",
-			Phone:         "+91 7309058513",
-			Github:        "github.com/Vivek-Prakash1307",
-			Linkedin:      "linkedin.com/in/vivek-prakash-00230a300",
-			Leetcode:      "leetcode.com/u/alivevivek8",
-			Geeksforgeeks: "geeksforgeeks.org/user/alivevng22/",
-		},
+	if c.GetHeader("If-None-Match") == resumeETag {
+		c.Status(http.StatusNotModified)
+		return
 	}
 
-	c.Header("Cache-Control", "public, max-age=300")
-	c.JSON(http.StatusOK, data)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", resumeJSON)
 }
 
-// handleContactForm processes contact form submissions and sends email
-func handleContactForm(c *gin.Context) {
-    var contactMsg ContactMessage
+func handleContactForm(dispatcher *emailDispatcher) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var contactMsg ContactMessage
+		if err := c.ShouldBindJSON(&contactMsg); err != nil {
+			status := http.StatusBadRequest
+			message := "Invalid input data."
+			if strings.Contains(err.Error(), "http: request body too large") {
+				status = http.StatusRequestEntityTooLarge
+				message = "Message payload is too large."
+			}
+			c.JSON(status, gin.H{"error": message})
+			return
+		}
 
-    // Bind and validate JSON input
-    if err := c.ShouldBindJSON(&contactMsg); err != nil {
-        log.Printf("❌ Bind error in /api/contact: %v", err)
-        c.JSON(http.StatusBadRequest, gin.H{
-            "error":   "Invalid input data",
-            "details": err.Error(),
-        })
-        return
-    }
+		contactMsg.normalize()
+		if err := contactMsg.validate(); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 
-    log.Printf("📩 Contact request: %+v", contactMsg)
+		emailConfig := EmailConfig{
+			APIKey:    getEnv("RESEND_API_KEY", ""),
+			FromEmail: getEnv("FROM_EMAIL", ""),
+			ToEmail:   getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
+		}
 
-    // ✅ Resend email config (HTTP API, no SMTP)
-    emailConfig := EmailConfig{
-        APIKey:    getEnv("RESEND_API_KEY", ""),
-        FromEmail: getEnv("FROM_EMAIL", ""),
-        ToEmail:   getEnv("TO_EMAIL", "alivevivek8@gmail.com"),
-    }
+		if err := emailConfig.validate(); err != nil {
+			log.Printf("email configuration error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Email service is not configured correctly."})
+			return
+		}
 
-    if emailConfig.APIKey == "" || emailConfig.FromEmail == "" {
-        log.Println("❌ Email not configured correctly – RESEND_API_KEY or FROM_EMAIL missing")
-        c.JSON(http.StatusInternalServerError, gin.H{
-            "error": "Email service is not configured correctly on server.",
-        })
-        return
-    }
+		if !dispatcher.enqueue(emailConfig, contactMsg) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": "Message queue is busy. Please try again in a moment.",
+			})
+			return
+		}
 
-    // Send email via Resend HTTP API
-    if err := sendEmail(emailConfig, contactMsg); err != nil {
-        log.Printf("❌ Failed to send email via Resend: %v", err)
-        c.JSON(http.StatusInternalServerError, gin.H{
-            "error": "Failed to send message. Please try again later.",
-        })
-        return
-    }
-
-    // Log the contact attempt
-    log.Printf("✅ Email sent successfully from %s (%s)", contactMsg.Name, contactMsg.Email)
-
-    c.JSON(http.StatusOK, gin.H{
-        "message": "Message sent successfully! I'll get back to you soon.",
-        "status":  "success",
-    })
+		c.JSON(http.StatusAccepted, gin.H{
+			"message": "Message accepted and is being delivered now.",
+			"status":  "queued",
+		})
+	}
 }
 
+func (m *ContactMessage) normalize() {
+	m.Name = compactSpace(m.Name)
+	m.Email = strings.ToLower(strings.TrimSpace(m.Email))
+	m.Message = strings.TrimSpace(m.Message)
+}
 
-// sendEmail sends the contact form email using SMTP
-// sendEmail uses Resend HTTP API to send the contact form email
-func sendEmail(config EmailConfig, contactMsg ContactMessage) error {
-    subject := fmt.Sprintf("Portfolio Contact: Message from %s", contactMsg.Name)
+func (m ContactMessage) validate() error {
+	if strings.ContainsAny(m.Name, "\r\n<>") {
+		return errors.New("Name contains unsupported characters.")
+	}
+	if len(m.Message) < 10 {
+		return errors.New("Message must be at least 10 characters.")
+	}
+	return nil
+}
 
-    body := fmt.Sprintf(`
-New contact form submission from your portfolio website:
+func (c EmailConfig) validate() error {
+	if c.APIKey == "" {
+		return errors.New("RESEND_API_KEY is missing")
+	}
+	if c.FromEmail == "" {
+		return errors.New("FROM_EMAIL is missing")
+	}
+	if c.ToEmail == "" {
+		return errors.New("TO_EMAIL is missing")
+	}
+	return nil
+}
+
+func sendEmail(ctx context.Context, config EmailConfig, contactMsg ContactMessage) error {
+	subject := fmt.Sprintf("Portfolio Contact: Message from %s", contactMsg.Name)
+	body := fmt.Sprintf(`New contact form submission from your portfolio website:
 
 Name: %s
 Email: %s
@@ -320,52 +280,270 @@ Message:
 
 --
 This message was sent from your portfolio contact form.
-`, contactMsg.Name, contactMsg.Email, time.Now().Format("2006-01-02 15:04:05"), contactMsg.Message)
+`, contactMsg.Name, contactMsg.Email, time.Now().UTC().Format(time.RFC3339), contactMsg.Message)
 
-    // Resend API payload
-    payload := map[string]interface{}{
-        "from":    fmt.Sprintf("Portfolio Contact <%s>", config.FromEmail),
-        "to":      []string{config.ToEmail},
-        "subject": subject,
-        "text":    body,
-    }
+	payload := map[string]any{
+		"from":     fmt.Sprintf("Portfolio Contact <%s>", config.FromEmail),
+		"to":       []string{config.ToEmail},
+		"reply_to": contactMsg.Email,
+		"subject":  subject,
+		"text":     body,
+	}
 
-    buf := new(bytes.Buffer)
-    if err := json.NewEncoder(buf).Encode(payload); err != nil {
-        return fmt.Errorf("failed to encode email payload: %w", err)
-    }
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(payload); err != nil {
+		return fmt.Errorf("encode email payload: %w", err)
+	}
 
-    req, err := http.NewRequest("POST", "https://api.resend.com/emails", buf)
-    if err != nil {
-        return fmt.Errorf("failed to create HTTP request: %w", err)
-    }
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, resendEndpoint, &buf)
+	if err != nil {
+		return fmt.Errorf("create resend request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+config.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 
-    req.Header.Set("Authorization", "Bearer "+config.APIKey)
-    req.Header.Set("Content-Type", "application/json")
+	resp, err := resendHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send resend request: %w", err)
+	}
+	defer resp.Body.Close()
 
-    client := &http.Client{
-        Timeout: 10 * time.Second,
-    }
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return fmt.Errorf("resend returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return fmt.Errorf("failed to send HTTP request to Resend: %w", err)
-    }
-    defer resp.Body.Close()
-
-    if resp.StatusCode >= 300 {
-        var respBody bytes.Buffer
-        _, _ = respBody.ReadFrom(resp.Body)
-        return fmt.Errorf("Resend returned status %d: %s", resp.StatusCode, respBody.String())
-    }
-
-    return nil
+	return nil
 }
 
+func newEmailDispatcher(queueSize int, sender func(context.Context, EmailConfig, ContactMessage) error) *emailDispatcher {
+	return &emailDispatcher{
+		queue: make(chan queuedEmail, queueSize),
+		send:  sender,
+	}
+}
 
-// ✅ helper function to safely load env vars
+func (d *emailDispatcher) enqueue(config EmailConfig, message ContactMessage) bool {
+	select {
+	case d.queue <- queuedEmail{config: config, message: message}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *emailDispatcher) start(workers int) {
+	for i := 0; i < workers; i++ {
+		go d.worker()
+	}
+}
+
+func (d *emailDispatcher) worker() {
+	for job := range d.queue {
+		d.deliver(job)
+	}
+}
+
+func (d *emailDispatcher) deliver(job queuedEmail) {
+	backoffs := []time.Duration{0, 250 * time.Millisecond, 750 * time.Millisecond}
+	for attempt, backoff := range backoffs {
+		if backoff > 0 {
+			time.Sleep(backoff)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		err := d.send(ctx, job.config, job.message)
+		cancel()
+
+		if err == nil {
+			log.Printf("contact email delivered from %s <%s>", job.message.Name, job.message.Email)
+			return
+		}
+
+		log.Printf("contact email delivery attempt %d failed: %v", attempt+1, err)
+	}
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	limiter := &rateLimiter{
+		visitors: make(map[string]*visitor),
+		limit:    limit,
+		window:   window,
+	}
+
+	go limiter.cleanup()
+	return limiter
+}
+
+func (r *rateLimiter) middleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := clientIP(c.Request)
+		now := time.Now()
+
+		r.mu.Lock()
+		v, ok := r.visitors[ip]
+		if !ok || now.After(v.expiresAt) {
+			v = &visitor{expiresAt: now.Add(r.window)}
+			r.visitors[ip] = v
+		}
+		v.count++
+		allowed := v.count <= r.limit
+		retryAfter := time.Until(v.expiresAt)
+		r.mu.Unlock()
+
+		if !allowed {
+			c.Header("Retry-After", fmt.Sprintf("%.0f", retryAfter.Seconds()))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "Too many contact attempts. Please try again later.",
+			})
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func (r *rateLimiter) cleanup() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
+		r.mu.Lock()
+		for ip, visitor := range r.visitors {
+			if now.After(visitor.expiresAt) {
+				delete(r.visitors, ip)
+			}
+		}
+		r.mu.Unlock()
+	}
+}
+
+func clientIP(r *http.Request) string {
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if ip := net.ParseIP(strings.TrimSpace(parts[0])); ip != nil {
+			return ip.String()
+		}
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func buildResumeData() ResumeData {
+	return ResumeData{
+		Name:    "Vivek Prakash",
+		Tagline: "Backend-Focused Full Stack Developer",
+		About:   "Backend-focused full-stack engineer building production-minded Go services, APIs, data pipelines, deployment workflows, and React interfaces for real-world systems.",
+		Skills: []SkillCategory{
+			{Category: "Backend Engineering", Items: []string{"Go", "Gin", "Fiber", "REST APIs", "JWT Auth", "Microservices", "Goroutines"}},
+			{Category: "Systems and Infrastructure", Items: []string{"Docker", "Linux", "HTTP", "DNS", "Reverse Proxies", "Kubernetes Basics", "CI/CD Basics"}},
+			{Category: "Data and Storage", Items: []string{"PostgreSQL", "MySQL", "MongoDB", "CSV Pipelines", "Caching", "Structured Logging"}},
+			{Category: "Frontend Delivery", Items: []string{"React", "TypeScript", "JavaScript", "Tailwind CSS", "Accessibility", "Playwright"}},
+		},
+		Projects: []Project{
+			{
+				Title:        "Automated Financial Data Extraction and Analysis System",
+				Description:  "A scalable Go data extraction and analysis platform for 500+ companies with concurrent scraping, checkpoint recovery, retry handling, and structured parsing pipelines.",
+				Github:       "https://github.com/Vivek-Prakash1307/Automated-Financial-Data-Extraction-and-Analysis-System-",
+				Technologies: []string{"Go", "Goroutines", "Concurrent Processing", "Web Scraping", "HTML Parsing", "Data Pipelines", "Checkpoint Recovery", "Structured Logging"},
+			},
+			{
+				Title:        "Repository-Centric Kubernetes Security Analysis Framework",
+				Description:  "A Kubernetes security analysis framework for repository-centric scanning, Helm chart analysis, RBAC validation, network policy checks, WebSocket operations, and posture scoring.",
+				Github:       "https://github.com/Aegios-k8s/major-project",
+				Technologies: []string{"Go", "Kubernetes", "Helm", "DevSecOps", "GitHub APIs", "WebSockets", "Docker"},
+			},
+			{
+				Title:        "Email Intelligence Platform",
+				Description:  "A production-ready full-stack email verification platform with concurrent domain checks, DNS MX lookup, SMTP validation, REST APIs, PostgreSQL, Docker, and cloud deployment.",
+				Github:       "https://github.com/Vivek-Prakash1307/email-intelligence-platform",
+				Technologies: []string{"Go", "Gin", "Goroutines", "REST APIs", "DNS MX Lookup", "React", "PostgreSQL", "Docker", "Render", "Vercel"},
+			},
+			{
+				Title:        "HTTP Load Balancer",
+				Description:  "A lightweight Go reverse proxy using round-robin load balancing, custom health checks, and fault-tolerant request distribution.",
+				Github:       "https://github.com/Vivek-Prakash1307/Load_Balancer",
+				Technologies: []string{"Go", "net/http", "Reverse Proxy", "Round-Robin Load Balancing", "Goroutines"},
+			},
+			{
+				Title:        "Chunked File Uploader",
+				Description:  "A React and TypeScript upload system with resumable chunks, retry flows, IndexedDB persistence, state-machine logic, checksum verification, and tests.",
+				Github:       "https://github.com/Vivek-Prakash1307/chunked-file-uploader",
+				Technologies: []string{"React", "TypeScript", "Vite", "IndexedDB", "Web Crypto API", "Vitest", "Playwright"},
+			},
+			{
+				Title:        "PPT-to-PDF Converter",
+				Description:  "A Go web application for document-to-PDF conversion using LibreOffice, concurrent processing, large uploads, progress tracking, Docker deployment, and cleanup routines.",
+				Github:       "https://github.com/Vivek-Prakash1307/PPT-TO-PDF-CONVERTER",
+				Technologies: []string{"Go", "Gin", "LibreOffice", "Docker", "Railway", "Concurrent Processing", "File Handling"},
+			},
+			{
+				Title:        "WeatherStack",
+				Description:  "A Go weather microservice using external weather APIs, caching, health checks, Docker support, and resilient REST endpoints.",
+				Github:       "https://github.com/Vivek-Prakash1307/weatherstack-go",
+				Technologies: []string{"Go", "Gin", "REST APIs", "Caching", "Docker", "Linux"},
+			},
+			{
+				Title:        "Web Server API",
+				Description:  "REST API endpoints with Gin and GORM for authentication and product management backed by MySQL CRUD workflows.",
+				Github:       "https://github.com/Vivek-Prakash1307/Web-Server-API",
+				Technologies: []string{"Go", "Gin", "GORM", "MySQL", "REST APIs", "Authentication"},
+			},
+			{
+				Title:        "TaskFlow Task Management App",
+				Description:  "A full-stack task management application with JWT authentication, kanban workflows, responsive UI, and real-time CRUD operations.",
+				Github:       "https://github.com/Vivek-Prakash1307/PrimeTrade",
+				Technologies: []string{"React", "Node.js", "Express", "MongoDB", "JWT", "Tailwind CSS"},
+			},
+		},
+		Contact: ContactInfo{
+			Email:         "alivevivek8@gmail.com",
+			Phone:         "+91 7309058513",
+			Github:        "github.com/Vivek-Prakash1307",
+			Linkedin:      "linkedin.com/in/vivek-prakash-00230a300",
+			Leetcode:      "leetcode.com/u/alivevivek8",
+			Geeksforgeeks: "geeksforgeeks.org/user/alivevng22/",
+		},
+	}
+}
+
+func parseCSVEnv(key, fallback string) []string {
+	raw := getEnv(key, fallback)
+	values := make([]string, 0, 4)
+	for _, value := range strings.Split(raw, ",") {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func compactSpace(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func mustJSON(value any) []byte {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+func weakETag(data []byte) string {
+	sum := sha256.Sum256(data)
+	return `W/"` + hex.EncodeToString(sum[:12]) + `"`
+}
+
 func getEnv(key, fallback string) string {
-	if value := os.Getenv(key); value != "" {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 		return value
 	}
 	return fallback
